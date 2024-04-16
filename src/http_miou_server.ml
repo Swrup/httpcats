@@ -155,7 +155,10 @@ let rec wait ((m, c, v) as stop) () =
     done;
     !v
   in
-  if value then raise Stop else wait stop ()
+  if value then (
+    Log.err (fun m -> m "unexpected raise Stop");
+    raise Stop)
+  else wait stop ()
 
 let stop () = (Miou.Mutex.create (), Miou.Condition.create (), ref false)
 

@@ -20,7 +20,10 @@ let reporter ppf =
 
 let () = Fmt_tty.setup_std_outputs ~style_renderer:`Ansi_tty ~utf_8:true ()
 let () = Logs.set_reporter (reporter Fmt.stderr)
-let () = Logs.set_level ~all:true (Some Logs.Debug)
+
+(* TODO swrup: debug: do not log huge response
+   so we can keep Logs.Debug here *)
+let () = Logs.set_level ~all:true (Some Logs.Error)
 let () = Logs_threaded.enable ()
 let () = Printexc.record_backtrace true
 
@@ -79,6 +82,8 @@ let rec cleanup orphans =
   | None | Some None -> ()
   | Some (Some prm) -> Miou.await_exn prm; cleanup orphans
 
+let bs = Bigstringaf.create 10_000_000
+
 let handler = function
   | `V2 _ -> assert false
   | `V1 reqd -> (
@@ -96,7 +101,8 @@ let handler = function
           let resp = Response.create ~headers `OK in
           let body = Reqd.request_body reqd in
           Body.close_reader body;
-          Reqd.respond_with_string reqd resp index_html
+          (*Reqd.respond_with_string reqd resp index_html*)
+          Reqd.respond_with_bigstring reqd resp bs
       | _ ->
           let headers = Headers.of_list [ ("content-length", "0") ] in
           let resp = Response.create ~headers `Not_found in
