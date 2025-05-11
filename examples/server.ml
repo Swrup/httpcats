@@ -132,39 +132,17 @@ let src = Logs.Src.create "examples/server.ml"
 
 module Log = (val Logs.src_log src : Logs.LOG)
 
-let rec clean_up orphans =
-  match Miou.care orphans with
-  | None | Some None -> ()
-  | Some (Some prm) -> (
-      match Miou.await prm with
-      | Ok () -> clean_up orphans
-      | Error exn ->
-          Log.err (fun m ->
-              m "unexpected exception: %s" (Printexc.to_string exn));
-          clean_up orphans)
-
-let echo_handler ~in_stream ~out_stream =
-  let rec loop () =
-    let opt = Bstream.get in_stream in
-    Bstream.put out_stream opt;
-    Option.iter (fun _v -> loop ()) opt
+let websocket_echo_handler ~in_stream ~out_stream =
+  let open Httpcats.Server in
+  let rec go () =
+    let frame_opt = Websocket_stream.get in_stream in
+    Websocket_stream.put out_stream frame_opt;
+    if Option.is_some frame_opt then go ()
   in
-  loop ()
+  go ()
 
 let upgrade (flow : Httpcats.Miou_flow.TCP.t) =
-  let orphans = Miou.orphans () in
-  let in_stream = Bstream.create 0x100 None in
-  let out_stream = Bstream.create 0x100 None in
-  let () =
-    ignore
-    @@ Miou.async ~orphans
-    @@ fun () -> echo_handler ~in_stream ~out_stream
-  in
-  let websocket_handler wsd =
-    Websocket.handler ~orphans ~in_stream ~out_stream wsd
-  in
-  Httpcats.Server.websocket_upgrade ~websocket_handler flow;
-  clean_up orphans;
+  Httpcats.Server.websocket_upgrade ~handler:websocket_echo_handler flow;
   ()
 
 let server stop sockaddr =

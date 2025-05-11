@@ -28,6 +28,25 @@ type error_handler =
 type handler =
   [ `Tcp of Miou_unix.file_descr | `Tls of Tls_miou_unix.t ] -> reqd -> unit
 
+type websocket_frame_kind =
+  [ `Connection_close
+  | `Msg of H1_ws.Websocket.Opcode.standard_non_control * bool
+  | `Other
+  | `Ping
+  | `Pong ]
+
+type websocket_frame = (websocket_frame_kind * bytes) option
+
+module Websocket_stream : sig
+  type t
+
+  val put : t -> websocket_frame -> unit
+  val get : t -> websocket_frame
+end
+
+type websocket_handler =
+  in_stream:Websocket_stream.t -> out_stream:Websocket_stream.t -> unit
+
 val clear :
      ?parallel:bool
   -> ?stop:stop
@@ -38,11 +57,6 @@ val clear :
   -> ?upgrade:(Miou_unix.file_descr -> unit)
   -> handler:handler
   -> Unix.sockaddr
-  -> unit
-
-val websocket_upgrade :
-     websocket_handler:(H1_ws.Wsd.t -> H1_ws.Websocket.input_handlers)
-  -> Miou_unix.file_descr
   -> unit
 
 val with_tls :
@@ -60,3 +74,6 @@ val with_tls :
   -> handler:handler
   -> Unix.sockaddr
   -> unit
+
+val websocket_upgrade :
+  handler:websocket_handler -> Miou_unix.file_descr -> unit
