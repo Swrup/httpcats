@@ -53,6 +53,8 @@ module Method = H2.Method
 module Headers = H2.Headers
 module Status = H2.Status
 
+type flow = [ `Tls of Tls_miou_unix.t | `Tcp of Miou_unix.file_descr ]
+
 type request = {
     meth: Method.t
   ; target: string
@@ -67,8 +69,7 @@ type reqd = [ `V1 of H1.Reqd.t | `V2 of H2.Reqd.t ]
 type error_handler =
   [ `V1 | `V2 ] -> ?request:request -> error -> (Headers.t -> body) -> unit
 
-type handler =
-  [ `Tcp of Miou_unix.file_descr | `Tls of Tls_miou_unix.t ] -> reqd -> unit
+type handler = flow -> reqd -> unit
 
 let request_from_H1 ~scheme { H1.Request.meth; target; headers; _ } =
   let headers = Headers.of_list (H1.Headers.to_list headers) in
@@ -322,31 +323,33 @@ let with_tls ?(parallel = true) ?stop
   Option.iter (fun c -> ignore (Miou.Computation.try_return c ())) ready;
   go (Miou.orphans ()) socket
 
-module D =
-  Runtime.Make
-    (TCP_and_H1)
-    (struct
-      (* make it match Runtime.S signature *)
-      include H1_ws.Server_connection
+(* -- websocket -- *)
 
-      let next_read_operation t =
-        (next_read_operation t :> [ `Read | `Close | `Upgrade | `Yield ])
+module H1_ws_server_connection = struct
+  (* make it match Runtime.S signature *)
+  include H1_ws.Server_connection
 
-      let next_write_operation t =
-        (next_write_operation t
-          :> [ `Write of Bigstringaf.t Faraday.iovec list
-             | `Close of int
-             | `Yield
-             | `Upgrade ])
+  let next_read_operation t =
+    (next_read_operation t :> [ `Read | `Close | `Upgrade | `Yield ])
 
-      let yield_reader _t _k = assert false
+  let next_write_operation t =
+    (next_write_operation t
+      :> [ `Write of Bigstringaf.t Faraday.iovec list
+         | `Close of int
+         | `Yield
+         | `Upgrade ])
 
-      let report_exn _t exn =
-        (* TODO
+  let yield_reader _t _k = assert false
+
+  let report_exn _t exn =
+    (* TODO
        implement report_exn in H1_ws, just need to close wsd? *)
-        Log.err (fun m -> m "websocket runtime: report_exn");
-        raise exn
-    end)
+    Log.err (fun m -> m "websocket runtime: report_exn");
+    raise exn
+end
+
+module D = Runtime.Make (TCP_and_H1) (H1_ws_server_connection)
+module E = Runtime.Make (Tls_miou_unix) (H1_ws_server_connection)
 
 type websocket_frame_kind =
   [ `Connection_close
@@ -441,8 +444,7 @@ let websocket_handler write_comp user_comp user_handler's wsd =
     in
     Websocket.{ frame_handler; eof }
   in
-  let write =
-   fun () ->
+  let write () =
     match Websocket_stream.get out_stream with
     | None -> `Stop
     | Some (kind, data) -> (
@@ -479,7 +481,11 @@ let websocket_upgrade ~handler flow =
     websocket_handler write_comp user_comp handler wsd
   in
   let conn = H1_ws.Server_connection.create ~websocket_handler in
-  let run_prm = D.run conn flow in
+  let run_prm =
+    match flow with
+    | `Tcp flow -> D.run conn flow
+    | `Tls flow -> E.run conn flow
+  in
   let write_prm = Miou.Computation.await_exn write_comp in
   let user_prm = Miou.Computation.await_exn user_comp in
   let l = Miou.await_all [ user_prm; write_prm; run_prm ] in

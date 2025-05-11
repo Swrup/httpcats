@@ -141,8 +141,8 @@ let websocket_echo_handler ~in_stream ~out_stream =
   in
   go ()
 
-let upgrade (flow : Httpcats.Miou_flow.TCP.t) =
-  Httpcats.Server.websocket_upgrade ~handler:websocket_echo_handler flow;
+let upgrade flow =
+  Httpcats.Server.websocket_upgrade ~handler:websocket_echo_handler (`Tcp flow);
   ()
 
 let server stop sockaddr =

@@ -11,6 +11,8 @@ type stop
 val stop : unit -> stop
 val switch : stop -> unit
 
+type flow = [ `Tls of Tls_miou_unix.t | `Tcp of Miou_unix.file_descr ]
+
 type request = {
     meth: Method.t
   ; target: string
@@ -25,8 +27,7 @@ type reqd = [ `V1 of H1.Reqd.t | `V2 of H2.Reqd.t ]
 type error_handler =
   [ `V1 | `V2 ] -> ?request:request -> error -> (Headers.t -> body) -> unit
 
-type handler =
-  [ `Tcp of Miou_unix.file_descr | `Tls of Tls_miou_unix.t ] -> reqd -> unit
+type handler = flow -> reqd -> unit
 
 type websocket_frame_kind =
   [ `Connection_close
@@ -75,5 +76,6 @@ val with_tls :
   -> Unix.sockaddr
   -> unit
 
-val websocket_upgrade :
-  handler:websocket_handler -> Miou_unix.file_descr -> unit
+(* TODO(upgrade)
+   should not be called on H2 connection (?) *)
+val websocket_upgrade : handler:websocket_handler -> flow -> unit

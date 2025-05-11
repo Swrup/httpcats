@@ -313,9 +313,9 @@ module Make (Flow : Flow.S) (Runtime : S) = struct
       | Error (Miou.Cancelled, _bt) ->
           (* no upgrade to cancel *)
           ()
-      | Error _ -> (* re-raise *) Miou.Computation.await_exn u_rd
+      | Error _ -> Miou.Computation.raise_if_errored u_rd
       | Ok () -> (
-          let () = Miou.Computation.await_exn u_wr in
+          Miou.Computation.await_exn u_wr;
           match upgrade with
           | None -> Fmt.failwith "Upgrade unsupported"
           | Some fn ->
