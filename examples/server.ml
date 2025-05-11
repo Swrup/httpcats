@@ -132,17 +132,17 @@ let src = Logs.Src.create "examples/server.ml"
 
 module Log = (val Logs.src_log src : Logs.LOG)
 
-let websocket_echo_handler ~in_stream ~out_stream =
-  let open Httpcats.Server in
+let websocket_echo_handler ic oc =
+  let open Httpcats.Server.Websocket in
   let rec go () =
-    let frame_opt = Websocket_stream.get in_stream in
-    Websocket_stream.put out_stream frame_opt;
-    if Option.is_some frame_opt then go ()
+    let frame = Bounded_stream.get ic in
+    Bounded_stream.put oc frame;
+    if Option.is_some frame then go ()
   in
   go ()
 
 let upgrade flow =
-  Httpcats.Server.websocket_upgrade ~handler:websocket_echo_handler (`Tcp flow);
+  Httpcats.Server.Websocket.upgrade ~handler:websocket_echo_handler (`Tcp flow);
   ()
 
 let server stop sockaddr =

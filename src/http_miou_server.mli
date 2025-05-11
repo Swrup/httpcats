@@ -29,24 +29,30 @@ type error_handler =
 
 type handler = flow -> reqd -> unit
 
-type websocket_frame_kind =
-  [ `Connection_close
-  | `Msg of H1_ws.Websocket.Opcode.standard_non_control * bool
-  | `Other
-  | `Ping
-  | `Pong ]
+module Websocket : sig
+  type frame =
+    ([ `Connection_close
+     | `Msg of H1_ws.Websocket.Opcode.standard_non_control * bool
+     | `Other
+     | `Ping
+     | `Pong ]
+    * bytes)
+    option
 
-type websocket_frame = (websocket_frame_kind * bytes) option
+  module Bounded_stream : sig
+    type ic
+    type oc
 
-module Websocket_stream : sig
-  type t
+    val get : ic -> frame
+    val put : oc -> frame -> unit
+  end
 
-  val put : t -> websocket_frame -> unit
-  val get : t -> websocket_frame
+  type handler = Bounded_stream.(ic) -> Bounded_stream.(oc) -> unit
+
+  (* TODO(upgrade)
+   should not be called on H2 connection (?) *)
+  val upgrade : handler:handler -> flow -> unit
 end
-
-type websocket_handler =
-  in_stream:Websocket_stream.t -> out_stream:Websocket_stream.t -> unit
 
 val clear :
      ?parallel:bool
@@ -75,7 +81,3 @@ val with_tls :
   -> handler:handler
   -> Unix.sockaddr
   -> unit
-
-(* TODO(upgrade)
-   should not be called on H2 connection (?) *)
-val websocket_upgrade : handler:websocket_handler -> flow -> unit
