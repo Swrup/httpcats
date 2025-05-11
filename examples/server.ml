@@ -135,9 +135,10 @@ module Log = (val Logs.src_log src : Logs.LOG)
 let websocket_echo_handler ic oc =
   let open Httpcats.Server.Websocket in
   let rec go () =
-    let frame = Bounded_stream.get ic in
-    Bounded_stream.put oc frame;
-    if Option.is_some frame then go ()
+    Bounded_stream.get ic
+    |> Option.iter (fun frame ->
+           Bounded_stream.put oc frame;
+           go ())
   in
   go ()
 

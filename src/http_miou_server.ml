@@ -350,149 +350,220 @@ module Websocket = struct
   module D = Runtime.Make (TCP_and_H1) (H1_ws_server_connection)
   module E = Runtime.Make (Tls_miou_unix) (H1_ws_server_connection)
 
-  type frame =
-    ([ `Connection_close
-     | `Msg of H1_ws.Websocket.Opcode.standard_non_control * bool
-     | `Other
-     | `Ping
-     | `Pong ]
-    * bytes)
-    option
+  type frame = H1_ws.Websocket.Opcode.t * bool * bytes
+
+  let connection_close_frame = (`Connection_close, true, Bytes.empty)
 
   module Bounded_stream = struct
     module Bstream = struct
-      (* copied from miou *)
-
       type 'a t = {
           buffer: 'a array
         ; mutable rd_pos: int
         ; mutable wr_pos: int
+        ; mutable closed: bool
         ; lock: Miou.Mutex.t
         ; non_empty: Miou.Condition.t
         ; non_full: Miou.Condition.t
       }
 
-      let create size v =
+      let create size =
         let lock = Miou.Mutex.create () in
         let non_empty = Miou.Condition.create () in
         let non_full = Miou.Condition.create () in
         {
-          buffer= Array.make size v
+          buffer= Array.make size None
         ; lock
         ; rd_pos= 0
         ; wr_pos= 0
+        ; closed= false
         ; non_empty
         ; non_full
         }
 
+      let close t =
+        Miou.Mutex.protect t.lock @@ fun () ->
+        t.closed <- true;
+        Miou.Condition.signal t.non_empty
+
       let put t data =
-        Miou.Mutex.lock t.lock;
-        while (t.wr_pos + 1) mod Array.length t.buffer = t.rd_pos do
-          Miou.Condition.wait t.non_full t.lock
-        done;
-        t.buffer.(t.wr_pos) <- data;
-        t.wr_pos <- (t.wr_pos + 1) mod Array.length t.buffer;
-        Miou.Condition.signal t.non_empty;
-        Miou.Mutex.unlock t.lock
+        Miou.Mutex.protect t.lock @@ fun () ->
+        if not @@ t.closed then (
+          while (t.wr_pos + 1) mod Array.length t.buffer = t.rd_pos do
+            Miou.Condition.wait t.non_full t.lock
+          done;
+          if not @@ t.closed then (
+            t.buffer.(t.wr_pos) <- Some data;
+            t.wr_pos <- (t.wr_pos + 1) mod Array.length t.buffer;
+            Miou.Condition.signal t.non_empty))
 
       let get t =
-        Miou.Mutex.lock t.lock;
-        while t.wr_pos = t.rd_pos do
+        Miou.Mutex.protect t.lock @@ fun () ->
+        while t.wr_pos = t.rd_pos && not t.closed do
           Miou.Condition.wait t.non_empty t.lock
         done;
-        let data = t.buffer.(t.rd_pos) in
-        t.rd_pos <- (t.rd_pos + 1) mod Array.length t.buffer;
-        Miou.Condition.signal t.non_full;
-        Miou.Mutex.unlock t.lock;
-        data
+        if t.closed && t.rd_pos = t.wr_pos then None
+        else
+          let data = t.buffer.(t.rd_pos) in
+          t.buffer.(t.rd_pos) <- None;
+          t.rd_pos <- (t.rd_pos + 1) mod Array.length t.buffer;
+          Miou.Condition.signal t.non_full;
+          data
     end
 
     include Bstream
 
-    type nonrec t = frame t
+    type nonrec t = frame option t
     type ic = t
     type oc = t
 
-    let create : unit -> t = fun () -> create 0x100 None
     let to_ic : t -> ic = Fun.id
     let to_oc : t -> oc = Fun.id
+    let create : unit -> t = fun () -> create 0x100
   end
 
   type handler = Bounded_stream.(ic) -> Bounded_stream.(oc) -> unit
 
-  let handler write_comp user_comp user_handler's wsd =
+  (* TODO allow server to initialize close handshake and also fail the connection *)
+  module Close_state = struct
+    type t = {
+        lock: Miou.Mutex.t
+      ; cond: Miou.Condition.t
+      ; mutable received: bool
+      ; mutable received_eof: bool
+      ; mutable emitted: bool
+      ; mutable emitted_eof: bool
+    }
+
+    let create () =
+      {
+        lock= Miou.Mutex.create ()
+      ; cond= Miou.Condition.create ()
+      ; received= false
+      ; received_eof= false
+      ; emitted= false
+      ; emitted_eof= false
+      }
+
+    let set_received t =
+      Miou.Mutex.protect t.lock @@ fun () ->
+      t.received <- true;
+      Miou.Condition.signal t.cond
+
+    let set_received_eof t =
+      Miou.Mutex.protect t.lock @@ fun () ->
+      t.received_eof <- true;
+      Miou.Condition.signal t.cond
+
+    let set_emmited t =
+      Miou.Mutex.protect t.lock @@ fun () ->
+      t.emitted <- true;
+      Miou.Condition.signal t.cond
+
+    let _set_emmited_eof t =
+      Miou.Mutex.protect t.lock @@ fun () ->
+      t.emitted_eof <- true;
+      Miou.Condition.signal t.cond
+
+    let on_closed t f =
+      Miou.Mutex.protect t.lock @@ fun () ->
+      while
+        not ((t.received && t.emitted) || t.received_eof || t.emitted_eof)
+      do
+        Miou.Condition.wait t.cond t.lock
+      done;
+      f ()
+  end
+
+  let websocket_handler comp user_handler's wsd =
     let open H1_ws in
     Log.debug (fun m -> m "Websocket.handler");
     let ic = Bounded_stream.create () in
     let oc = Bounded_stream.create () in
+    let close_state = Close_state.create () in
     let input_handlers =
       let frame_handler ~opcode ~is_fin bstr ~off ~len =
+        Log.debug (fun m ->
+            m "Websocket frame: (%a, is_fin=%b)" Websocket.Opcode.pp_hum opcode
+              is_fin);
         let data =
           let s = Bigstringaf.substring bstr ~off ~len in
           String.to_bytes s
         in
-        let v =
-          match opcode with
-          | `Other _ -> (`Other, data)
-          | #Websocket.Opcode.standard_control as kind -> (kind, data)
-          | #Websocket.Opcode.standard_non_control as kind ->
-              (`Msg (kind, is_fin), data)
-        in
-        Bounded_stream.put ic (Some v)
+        Bounded_stream.put ic (opcode, is_fin, data);
+        match opcode with
+        | `Connection_close ->
+            Bounded_stream.close ic;
+            Close_state.set_received close_state;
+            ()
+        | _ -> ()
       in
       let eof () =
-        Log.debug (fun m -> m "Websocket eof");
-        Bounded_stream.put ic None
+        Log.debug (fun m -> m "Websocket frame: EOF");
+        Bounded_stream.close ic;
+        Close_state.set_received_eof close_state;
+        ()
       in
       Websocket.{ frame_handler; eof }
     in
-    let write () =
+    let rec write () =
       match Bounded_stream.get oc with
-      | None -> `Stop
-      | Some (kind, data) -> (
-          match kind with
-          | `Connection_close -> `Stop
-          | `Ping -> Wsd.send_ping wsd; `Continue
-          | `Pong -> Wsd.send_pong wsd; `Continue
-          | `Other -> failwith "unsuported frame of kind `Other"
-          | `Msg (kind, is_fin) ->
-              Log.debug (fun m ->
-                  m "Websocket write loop: `Msg (%a, is_fin=%b)"
-                    Websocket.Opcode.pp_hum
-                    (kind :> Websocket.Opcode.t)
-                    is_fin);
-              let len = Bytes.length data in
-              Wsd.send_bytes wsd ~kind ~is_fin data ~off:0 ~len;
-              `Continue)
+      | None ->
+          Log.debug (fun m -> m "Websocket write loop stoped");
+          ()
+      | Some (opcode, is_fin, data) ->
+          Log.debug (fun m ->
+              m "Websocket write loop: (opcode: %a, is_fin: %b)"
+                Websocket.Opcode.pp_hum opcode is_fin);
+          begin
+            match opcode with
+            | `Other _i -> failwith "unsuported frame of kind `Other"
+            | `Ping -> Wsd.send_ping wsd
+            | `Pong -> Wsd.send_pong wsd
+            | (`Continuation | `Text | `Binary) as kind ->
+                let len = Bytes.length data in
+                Wsd.send_bytes wsd ~kind ~is_fin data ~off:0 ~len;
+                ()
+            | `Connection_close ->
+                (* TODO
+                   Wsd.close write a final `Connection_close frame.
+
+                   - this make it not possible to initiate a close handcheck by server
+                     without incorrectly sending another close frame after the initial one
+
+                   - i think the runtime is signaled by Wsd.close that the connection is shutdown
+                     before the runtime's writer handled the close frame *)
+                Bounded_stream.close oc;
+                Close_state.set_emmited close_state;
+                ()
+          end;
+          write ()
     in
-    let rec go () =
-      match write () with `Stop -> Wsd.close wsd; () | `Continue -> go ()
+    let close () =
+      Close_state.on_closed close_state (fun () ->
+          Log.debug (fun m -> m "Websocket Close_state.on_closed");
+          Wsd.close wsd)
     in
-    let write_prm = Miou.async @@ fun () -> go () in
-    let user_prm =
+    let user's_handler =
       let ic = Bounded_stream.to_ic ic in
       let oc = Bounded_stream.to_oc oc in
-      Miou.async @@ fun () -> user_handler's ic oc
+      fun () -> user_handler's ic oc
     in
-    ignore (Miou.Computation.try_return write_comp write_prm);
-    ignore (Miou.Computation.try_return user_comp user_prm);
+    let tasks = [ write; close; user's_handler ] in
+    ignore (Miou.Computation.try_return comp tasks);
     input_handlers
 
   let upgrade ~handler:user's_handler flow =
-    let write_comp = Miou.Computation.create () in
-    let user_comp = Miou.Computation.create () in
-    let websocket_handler wsd =
-      handler write_comp user_comp user's_handler wsd
-    in
+    let comp = Miou.Computation.create () in
+    let websocket_handler wsd = websocket_handler comp user's_handler wsd in
     let conn = H1_ws.Server_connection.create ~websocket_handler in
     let run_prm =
       match flow with
       | `Tcp flow -> D.run conn flow
       | `Tls flow -> E.run conn flow
     in
-    let write_prm = Miou.Computation.await_exn write_comp in
-    let user_prm = Miou.Computation.await_exn user_comp in
-    let l = Miou.await_all [ user_prm; write_prm; run_prm ] in
-    List.iter (function Error exn -> Miou.reraise exn | Ok _ -> ()) l;
+    let tasks = Miou.Computation.await_exn comp in
+    let prms = run_prm :: List.map (fun task -> Miou.async task) tasks in
+    Miou.await_all prms
+    |> List.iter (function Error exn -> Miou.reraise exn | Ok () -> ());
     ()
 end

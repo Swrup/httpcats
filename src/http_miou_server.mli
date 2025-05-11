@@ -30,24 +30,20 @@ type error_handler =
 type handler = flow -> reqd -> unit
 
 module Websocket : sig
-  type frame =
-    ([ `Connection_close
-     | `Msg of H1_ws.Websocket.Opcode.standard_non_control * bool
-     | `Other
-     | `Ping
-     | `Pong ]
-    * bytes)
-    option
+  type frame = H1_ws.Websocket.Opcode.t * bool * bytes
+
+  val connection_close_frame : frame
 
   module Bounded_stream : sig
     type ic
     type oc
 
-    val get : ic -> frame
+    val get : ic -> frame option
     val put : oc -> frame -> unit
+    val close : oc -> unit
   end
 
-  type handler = Bounded_stream.(ic) -> Bounded_stream.(oc) -> unit
+  type handler = Bounded_stream.ic -> Bounded_stream.oc -> unit
 
   (* TODO(upgrade)
    should not be called on H2 connection (?) *)

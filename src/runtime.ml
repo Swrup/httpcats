@@ -298,7 +298,7 @@ module Make (Flow : Flow.S) (Runtime : S) = struct
         List.iter (fun fn -> ignore (Miou.async ~orphans fn)) lst;
         if not (is_shutdown conn) then go orphans
         else begin
-          Log.debug (fun m -> m "connection closed");
+          Log.debug (fun m -> m "+connection is shutdown");
           let _ = Miou.Computation.try_cancel u_rd (Miou.Cancelled, empty_bt) in
           let _ = Miou.Computation.try_cancel u_wr (Miou.Cancelled, empty_bt) in
           ()
