@@ -361,6 +361,7 @@ module Websocket = struct
         ; mutable rd_pos: int
         ; mutable wr_pos: int
         ; mutable closed: bool
+        ; mutable halted: bool
         ; lock: Miou.Mutex.t
         ; non_empty: Miou.Condition.t
         ; non_full: Miou.Condition.t
@@ -376,6 +377,7 @@ module Websocket = struct
         ; rd_pos= 0
         ; wr_pos= 0
         ; closed= false
+        ; halted= false
         ; non_empty
         ; non_full
         }
@@ -385,23 +387,28 @@ module Websocket = struct
         t.closed <- true;
         Miou.Condition.signal t.non_empty
 
+      let halt t =
+        Miou.Mutex.protect t.lock @@ fun () ->
+        t.halted <- true;
+        Miou.Condition.signal t.non_empty
+
       let put t data =
         Miou.Mutex.protect t.lock @@ fun () ->
-        if not @@ t.closed then (
+        if not (t.closed || t.halted) then (
           while (t.wr_pos + 1) mod Array.length t.buffer = t.rd_pos do
             Miou.Condition.wait t.non_full t.lock
           done;
-          if not @@ t.closed then (
+          if not (t.closed || t.halted) then (
             t.buffer.(t.wr_pos) <- Some data;
             t.wr_pos <- (t.wr_pos + 1) mod Array.length t.buffer;
             Miou.Condition.signal t.non_empty))
 
       let get t =
         Miou.Mutex.protect t.lock @@ fun () ->
-        while t.wr_pos = t.rd_pos && not t.closed do
+        while t.wr_pos = t.rd_pos && not (t.closed || t.halted) do
           Miou.Condition.wait t.non_empty t.lock
         done;
-        if t.closed && t.rd_pos = t.wr_pos then None
+        if t.halted || (t.closed && t.rd_pos = t.wr_pos) then None
         else
           let data = t.buffer.(t.rd_pos) in
           t.buffer.(t.rd_pos) <- None;
@@ -423,15 +430,14 @@ module Websocket = struct
 
   type handler = Bounded_stream.(ic) -> Bounded_stream.(oc) -> unit
 
-  (* TODO allow server to initialize close handshake and also fail the connection *)
   module Close_state = struct
+    (* TODO do we need the lock? *)
     type t = {
         lock: Miou.Mutex.t
       ; cond: Miou.Condition.t
       ; mutable received: bool
-      ; mutable received_eof: bool
       ; mutable emitted: bool
-      ; mutable emitted_eof: bool
+      ; mutable eof: bool
     }
 
     let create () =
@@ -439,9 +445,8 @@ module Websocket = struct
         lock= Miou.Mutex.create ()
       ; cond= Miou.Condition.create ()
       ; received= false
-      ; received_eof= false
       ; emitted= false
-      ; emitted_eof= false
+      ; eof= false
       }
 
     let set_received t =
@@ -449,29 +454,22 @@ module Websocket = struct
       t.received <- true;
       Miou.Condition.signal t.cond
 
-    let set_received_eof t =
-      Miou.Mutex.protect t.lock @@ fun () ->
-      t.received_eof <- true;
-      Miou.Condition.signal t.cond
-
     let set_emmited t =
       Miou.Mutex.protect t.lock @@ fun () ->
       t.emitted <- true;
       Miou.Condition.signal t.cond
 
-    let _set_emmited_eof t =
+    let set_eof t =
       Miou.Mutex.protect t.lock @@ fun () ->
-      t.emitted_eof <- true;
+      t.eof <- true;
       Miou.Condition.signal t.cond
 
-    let on_closed t f =
+    let on_close t f =
       Miou.Mutex.protect t.lock @@ fun () ->
-      while
-        not ((t.received && t.emitted) || t.received_eof || t.emitted_eof)
-      do
+      while not ((t.received && t.emitted) || t.eof) do
         Miou.Condition.wait t.cond t.lock
       done;
-      f ()
+      f t.received t.emitted
   end
 
   let websocket_handler comp user_handler's wsd =
@@ -499,8 +497,7 @@ module Websocket = struct
       in
       let eof () =
         Log.debug (fun m -> m "Websocket frame: EOF");
-        Bounded_stream.close ic;
-        Close_state.set_received_eof close_state;
+        Close_state.set_eof close_state;
         ()
       in
       Websocket.{ frame_handler; eof }
@@ -525,13 +522,9 @@ module Websocket = struct
                 ()
             | `Connection_close ->
                 (* TODO
-                   Wsd.close write a final `Connection_close frame.
-
-                   - this make it not possible to initiate a close handcheck by server
-                     without incorrectly sending another close frame after the initial one
-
-                   - i think the runtime is signaled by Wsd.close that the connection is shutdown
-                     before the runtime's writer handled the close frame *)
+                   Wsd.close write a final `Connection_close frame and close the conn
+                   to have the server be able to start a close handcheck
+                   we need a `Wsd.send_close` that write a close frame without actually closing the conn *)
                 Bounded_stream.close oc;
                 Close_state.set_emmited close_state;
                 ()
@@ -539,9 +532,16 @@ module Websocket = struct
           write ()
     in
     let close () =
-      Close_state.on_closed close_state (fun () ->
-          Log.debug (fun m -> m "Websocket Close_state.on_closed");
-          Wsd.close wsd)
+      Close_state.on_close close_state (fun received emitted ->
+          Wsd.close wsd;
+          if received && emitted then (
+            Log.debug (fun m -> m "websocket clean close");
+            ())
+          else (
+            Log.debug (fun m -> m "websocket unclean close");
+            Bounded_stream.halt ic;
+            Bounded_stream.halt oc;
+            ()))
     in
     let user's_handler =
       let ic = Bounded_stream.to_ic ic in
