@@ -32,15 +32,12 @@ type handler = flow -> reqd -> unit
 module Websocket : sig
   type frame = H1_ws.Websocket.Opcode.t * bool * bytes
 
-  val connection_close_frame : frame
-
   module Bounded_stream : sig
     type ic
     type oc
 
     val get : ic -> frame option
     val put : oc -> frame -> unit
-    val close : oc -> unit
   end
 
   type handler = Bounded_stream.ic -> Bounded_stream.oc -> unit
